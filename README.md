@@ -60,3 +60,4 @@ serializer.array_iter_u16(some_hash_map.keys().cloned());
 -   Versioning
 -   Named fields
 -   JSON / BSON / `serde` compatibility
+-   Compression
