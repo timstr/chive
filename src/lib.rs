@@ -3,21 +3,31 @@ mod test;
 
 use std::{fs, io, marker::PhantomData, path::Path};
 
-pub trait Serializable: Sized {
-    fn serialize(&self, serializer: &mut Serializer);
-    fn deserialize(deserializer: &mut Deserializer) -> Result<Self, ()>;
+/// Trait for a user-defined type that can be serialized and deserialized
+/// into a Chive.
+pub trait Chivable: Sized {
+    /// Serialize self into the ChiveIn by adding all
+    /// relevant members in a stable order
+    fn chive_in(&self, chive_in: &mut ChiveIn);
+
+    /// Create a new instance of Self by deserializing
+    /// all relevant members in the same order they were
+    /// serialized by Self::chive_in()
+    fn chive_out(chive_out: &mut ChiveOut) -> Result<Self, ()>;
 }
 
-impl Serializable for () {
-    fn serialize(&self, _serializer: &mut Serializer) {
+/// Default implementation for the unit type
+impl Chivable for () {
+    fn chive_in(&self, _chive_in: &mut ChiveIn) {
         // Nothing to do
     }
 
-    fn deserialize(_deserializer: &mut Deserializer) -> Result<Self, ()> {
+    fn chive_out(_chive_out: &mut ChiveOut) -> Result<Self, ()> {
         Ok(())
     }
 }
 
+/// Enum for the set of primitive fixed-size types that are supported
 #[derive(PartialEq, Eq, Debug)]
 pub enum PrimitiveType {
     Bool,
@@ -33,25 +43,25 @@ pub enum PrimitiveType {
     F64,
 }
 
+/// Enum for set the of value types that are supported
 #[derive(PartialEq, Eq, Debug)]
 pub enum ValueType {
+    /// A fixed-size primitive, e.g. boolean, integer, or floating point number
     Primitive(PrimitiveType),
 
-    // A list of values of a common type whose
-    // number of elements can be queried
+    /// A list of values of a common primitive type whose number of elements can be queried
     Array(PrimitiveType),
 
-    // A utf-8 encoded string
+    /// A utf-8 encoded string
     String,
 
-    // A logically grouped sequence of values
-    // whose size in bytes can be queried,
-    // useful during serialization to safely
-    // divide work into non-overlapping chunks
-    SubArchive,
+    /// A chive within. Useful for encapsulating and separating sections of the chive
+    /// for different purposes.
+    Nest,
 }
 
 impl PrimitiveType {
+    /// Returns an integer with value 0xF or less, used to uniquely tag each primitive type
     fn to_nibble(&self) -> u8 {
         match self {
             PrimitiveType::Bool => 0x01,
@@ -68,6 +78,7 @@ impl PrimitiveType {
         }
     }
 
+    /// Constructs a PrimitiveType from an integer value as returned by to_nibble()
     fn from_nibble(byte: u8) -> Result<PrimitiveType, ()> {
         match byte {
             0x01 => Ok(PrimitiveType::Bool),
@@ -87,15 +98,17 @@ impl PrimitiveType {
 }
 
 impl ValueType {
+    /// Returns an integer used to uniquely tag each value type
     fn to_byte(&self) -> u8 {
         match self {
             ValueType::Primitive(prim_type) => 0x00 | prim_type.to_nibble(),
             ValueType::Array(prim_type) => 0x10 | prim_type.to_nibble(),
             ValueType::String => 0x20,
-            ValueType::SubArchive => 0x30,
+            ValueType::Nest => 0x30,
         }
     }
 
+    /// Constructs a ValueType from an integer value as returned by to_byte()
     fn from_byte(byte: u8) -> Result<ValueType, ()> {
         let hi_nibble = byte & 0xF0;
         let lo_nibble = byte & 0x0F;
@@ -103,22 +116,32 @@ impl ValueType {
             0x00 => Ok(ValueType::Primitive(PrimitiveType::from_nibble(lo_nibble)?)),
             0x10 => Ok(ValueType::Array(PrimitiveType::from_nibble(lo_nibble)?)),
             0x20 => Ok(ValueType::String),
-            0x30 => Ok(ValueType::SubArchive),
+            0x30 => Ok(ValueType::Nest),
             _ => Err(()),
         }
     }
 }
 
-trait PrimitiveReadWrite: Sized + 'static {
+/// Helper trait for serializing primitives directly
+trait PrimitiveReadWrite {
+    /// The number of bytes occupied by the value itself in memory
     const SIZE: usize;
+
+    /// The PrimitiveType that this type corresponds to, e.g. PrimitiveType::I32 for i32
     const TYPE: PrimitiveType;
+
+    /// Write self to the byte vector
     fn write_to(&self, data: &mut Vec<u8>);
 
-    // Precondition: the deserializer has a remaining length of
-    // at least `Self::SIZE` bytes
-    fn read_from(data: &mut Deserializer) -> Self;
+    /// Read self from the byte vector.
+    /// This method may panic if there are fewer than Self::SIZE bytes in the vector.
+    fn read_from(data: &mut ChiveOut) -> Self;
 }
 
+/// Macro for implementing the PrimitiveReadWrite helper trait for a given
+/// Rust type, given its size in bytes and its corresponding PrimitiveType.
+/// The methods `to_be_bytes()` and `from_be_bytes` are used, which exist
+/// for all primitive integer and floating point types
 macro_rules! impl_primitive_read_write {
     ($primitive: ident, $size: literal, $typetag: expr) => {
         impl PrimitiveReadWrite for $primitive {
@@ -129,7 +152,7 @@ macro_rules! impl_primitive_read_write {
                     data.push(b);
                 }
             }
-            fn read_from(d: &mut Deserializer) -> Self {
+            fn read_from(d: &mut ChiveOut) -> Self {
                 let mut bytes = Self::default().to_be_bytes();
                 for b in &mut bytes {
                     *b = d.read_byte().unwrap();
@@ -151,6 +174,8 @@ impl_primitive_read_write!(i64, 8, PrimitiveType::I64);
 impl_primitive_read_write!(f32, 4, PrimitiveType::F32);
 impl_primitive_read_write!(f64, 8, PrimitiveType::F64);
 
+/// Explicit implementation of PrimitiveReadWrite for bool,
+/// which does not have from_be_bytes() / to_be_bytes()
 impl PrimitiveReadWrite for bool {
     const SIZE: usize = 1;
     const TYPE: PrimitiveType = PrimitiveType::Bool;
@@ -159,24 +184,48 @@ impl PrimitiveReadWrite for bool {
         data.push(if *self { 1 } else { 0 });
     }
 
-    fn read_from(d: &mut Deserializer) -> bool {
+    fn read_from(d: &mut ChiveOut) -> bool {
         d.read_byte().unwrap() != 0
     }
 }
 
-pub struct Archive {
+/// An in-memory archive of serialized data, which is simply a flat sequence
+/// of bytes that can be saved, sent, copied, loaded, and deserialized again
+/// at a different time and place.
+///
+/// To serialize data structures, use the [Chive::with_chive_in] method and
+/// then use the given [ChiveIn] object to write individual values and objects.
+///
+/// To deserialize data structures, use the [Chive::chive_out] method and then
+/// use the returned [ChiveOut] object to read data in the same order it was
+/// written during serialization.
+pub struct Chive {
+    /// The serialized data. This may have been loaded from an arbitrary file
+    /// or created from an arbitrary vector, and so may not have a valid structure.
+    /// Validation is performed during deserialization using a Result<> return
+    /// type on each deserialization method.
     data: Vec<u8>,
 }
 
-impl Archive {
-    pub fn serialize_with<F: Fn(Serializer)>(f: F) -> Archive {
+/// Public methods
+impl Chive {
+    /// Create a new Chive instance by serializing data a user-provided function
+    /// that receives a [ChiveIn] instance. The body of the function needs to
+    /// write all relevant data to the [ChiveIn] object. It is (currently) not
+    /// possible to write additional data afterwards.
+    ///
+    /// Returns a Chive instance containing a flattened representation of all
+    /// data that was given to the [ChiveIn] object.
+    pub fn with_chive_in<F: Fn(ChiveIn)>(f: F) -> Chive {
         let mut data = Vec::<u8>::new();
-        let serializer = Serializer::new_with_prefix_len(&mut data);
-        f(serializer);
-        Archive { data }
+        let chive_in = ChiveIn::new_with_prefix_len(&mut data);
+        f(chive_in);
+        Chive { data }
     }
 
-    pub fn deserialize<'a>(&'a self) -> Result<Deserializer<'a>, ()> {
+    /// Get a [ChiveOut] instance to deserialize and retrieve individual values
+    /// out of the raw binary data.
+    pub fn chive_out<'a>(&'a self) -> Result<ChiveOut<'a>, ()> {
         if self.data.len() < 4 {
             return Err(());
         }
@@ -186,50 +235,71 @@ impl Archive {
         if len != slice.len() {
             return Err(());
         }
-        Ok(Deserializer {
+        Ok(ChiveOut {
             data: slice,
             position: 0,
         })
     }
 
+    /// Write the binary contents the chive to a file at the given path
     pub fn dump_to_file(&self, path: &Path) -> Result<(), io::Error> {
+        // TODO: magic number?
         fs::write(path, &self.data)?;
         Ok(())
     }
 
-    pub fn load_from_file(path: &Path) -> Result<Archive, io::Error> {
+    /// Read the file at the given path and load its binary data into
+    /// a new Chive instance. No validation of the contents is performed.
+    pub fn load_from_file(path: &Path) -> Result<Chive, io::Error> {
+        // TODO: magic number?
         let data = fs::read(path)?;
-        Ok(Archive { data })
+        Ok(Chive { data })
     }
 
+    /// Take the underlying vector of bytes
     pub fn into_vec(self) -> Vec<u8> {
         self.data
     }
 
-    pub fn from_vec(data: Vec<u8>) -> Archive {
-        Archive { data }
+    /// Construct a new Chive instance from a vector of bytes.
+    /// No validation of the contents is performed.
+    pub fn from_vec(data: Vec<u8>) -> Chive {
+        Chive { data }
     }
 }
 
-pub struct Serializer<'a> {
+/// ChiveIn is used to serialize user-provided data in to a [Chive] instance.
+pub struct ChiveIn<'a> {
+    /// Mutable reference to a vector of bytes which all serialized data
+    /// will be written to
     data: &'a mut Vec<u8>,
+
+    /// Index in the data vector where the length of the serialized data
+    /// will be written to after serializing, such that during deserialization,
+    /// the length of the data can be read first.
+    // TODO: get rid of this, add a ChiveIn::nest<F: FnOnce(&mut ChiveIn)>(F)
+    // method instead
     start_index: usize,
 }
 
-impl<'a> Serializer<'a> {
-    fn new_with_prefix_len(data: &'a mut Vec<u8>) -> Serializer<'a> {
+/// Private methods
+impl<'a> ChiveIn<'a> {
+    // TODO: get rid of this
+    fn new_with_prefix_len(data: &'a mut Vec<u8>) -> ChiveIn<'a> {
         let start_index = data.len();
         let placeholder_len: u32 = 0;
         placeholder_len.write_to(data);
-        Serializer { data, start_index }
+        ChiveIn { data, start_index }
     }
 
+    /// Helper method to write a primitive
     fn write_primitive<T: PrimitiveReadWrite>(&mut self, x: T) {
         self.data.reserve(u8::SIZE + T::SIZE);
         self.data.push(ValueType::Primitive(T::TYPE).to_byte());
         x.write_to(self.data);
     }
 
+    /// Helper method to write a slice of primitives
     fn write_primitive_array_slice<T: PrimitiveReadWrite>(&mut self, x: &[T]) {
         self.data
             .reserve(u8::SIZE + u32::SIZE + (x.len() * T::SIZE));
@@ -241,6 +311,7 @@ impl<'a> Serializer<'a> {
         }
     }
 
+    /// Helper method to write an iterator of primitives
     fn write_primitive_array_iter<I: Iterator>(&mut self, mut it: I)
     where
         I::Item: PrimitiveReadWrite,
@@ -257,100 +328,161 @@ impl<'a> Serializer<'a> {
             self.data[array_start_index + i] = *b;
         }
     }
+}
 
+/// Public methods
+impl<'a> ChiveIn<'a> {
+    /// Write a single u8 value
     pub fn u8(&mut self, x: u8) {
         self.write_primitive::<u8>(x);
     }
+
+    /// Write a single i8 value
     pub fn i8(&mut self, x: i8) {
         self.write_primitive::<i8>(x);
     }
+
+    /// Write a single u16 value
     pub fn u16(&mut self, x: u16) {
         self.write_primitive::<u16>(x);
     }
+
+    /// Write a single i16 value
     pub fn i16(&mut self, x: i16) {
         self.write_primitive::<i16>(x);
     }
+
+    /// Write a single u32 value
     pub fn u32(&mut self, x: u32) {
         self.write_primitive::<u32>(x);
     }
+
+    /// Write a single i32 value
     pub fn i32(&mut self, x: i32) {
         self.write_primitive::<i32>(x);
     }
+
+    /// Write a single u64 value
     pub fn u64(&mut self, x: u64) {
         self.write_primitive::<u64>(x);
     }
+
+    /// Write a single i64 value
     pub fn i64(&mut self, x: i64) {
         self.write_primitive::<i64>(x);
     }
+
+    /// Write a single f32 value
     pub fn f32(&mut self, x: f32) {
         self.write_primitive::<f32>(x);
     }
+
+    /// Write a single f64 value
     pub fn f64(&mut self, x: f64) {
         self.write_primitive::<f64>(x);
     }
 
+    /// Write an array of u8 values from a slice
     pub fn array_slice_u8(&mut self, x: &[u8]) {
         self.write_primitive_array_slice::<u8>(x);
     }
+
+    /// Write an array of i8 values from a slice
     pub fn array_slice_i8(&mut self, x: &[i8]) {
         self.write_primitive_array_slice::<i8>(x);
     }
+
+    /// Write an array of u16 values from a slice
     pub fn array_slice_u16(&mut self, x: &[u16]) {
         self.write_primitive_array_slice::<u16>(x);
     }
+
+    /// Write an array of i16 values from a slice
     pub fn array_slice_i16(&mut self, x: &[i16]) {
         self.write_primitive_array_slice::<i16>(x);
     }
+
+    /// Write an array of u32 values from a slice
     pub fn array_slice_u32(&mut self, x: &[u32]) {
         self.write_primitive_array_slice::<u32>(x);
     }
+
+    /// Write an array of i32 values from a slice
     pub fn array_slice_i32(&mut self, x: &[i32]) {
         self.write_primitive_array_slice::<i32>(x);
     }
+
+    /// Write an array of u64 values from a slice
     pub fn array_slice_u64(&mut self, x: &[u64]) {
         self.write_primitive_array_slice::<u64>(x);
     }
+
+    /// Write an array of i64 values from a slice
     pub fn array_slice_i64(&mut self, x: &[i64]) {
         self.write_primitive_array_slice::<i64>(x);
     }
+
+    /// Write an array of f32 values from a slice
     pub fn array_slice_f32(&mut self, x: &[f32]) {
         self.write_primitive_array_slice::<f32>(x);
     }
+
+    /// Write an array of f64 values from a slice
     pub fn array_slice_f64(&mut self, x: &[f64]) {
         self.write_primitive_array_slice::<f64>(x);
     }
 
+    /// Write an array of u8 values from an iterator
     pub fn array_iter_u8<I: Iterator<Item = u8>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of i8 values from an iterator
     pub fn array_iter_i8<I: Iterator<Item = i8>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of u16 values from an iterator
     pub fn array_iter_u16<I: Iterator<Item = u16>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of i16 values from an iterator
     pub fn array_iter_i16<I: Iterator<Item = i16>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of u32 values from an iterator
     pub fn array_iter_u32<I: Iterator<Item = u32>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of i32 values from an iterator
     pub fn array_iter_i32<I: Iterator<Item = i32>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of u64 values from an iterator
     pub fn array_iter_u64<I: Iterator<Item = u64>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of i64 values from an iterator
     pub fn array_iter_i64<I: Iterator<Item = i64>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of f32 values from an iterator
     pub fn array_iter_f32<I: Iterator<Item = f32>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
+
+    /// Write an array of f64 values from an iterator
     pub fn array_iter_f64<I: Iterator<Item = f64>>(&mut self, it: I) {
         self.write_primitive_array_iter(it);
     }
 
+    /// Write a string
     pub fn string(&mut self, x: &str) {
         let bytes = x.as_bytes();
         self.data.reserve(u8::SIZE + u32::SIZE + bytes.len());
@@ -362,69 +494,99 @@ impl<'a> Serializer<'a> {
         }
     }
 
-    pub fn subarchive<'b>(&'b mut self) -> Serializer<'b> {
-        self.data.push(ValueType::SubArchive.to_byte());
-        Serializer::new_with_prefix_len(self.data)
+    // TODO: replace this with something that takes a function,
+    // instead of returning a borrowing ChiveIn instance
+    pub fn nest<'b>(&'b mut self) -> ChiveIn<'b> {
+        self.data.push(ValueType::Nest.to_byte());
+        ChiveIn::new_with_prefix_len(self.data)
     }
 
-    pub fn object<T: Serializable>(&mut self, object: &T) {
-        object.serialize(self);
+    /// Write a user-provided object which implements Chivable
+    pub fn chivable<T: Chivable>(&mut self, chivable: &T) {
+        chivable.chive_in(self);
     }
 }
 
-impl<'a> Drop for Serializer<'a> {
+// TODO: remove
+impl<'a> Drop for ChiveIn<'a> {
     fn drop(&mut self) {
         let new_len = self.data.len();
         let delta_len = new_len - self.start_index;
         debug_assert!(delta_len >= u32::SIZE);
-        let subarchive_line = (delta_len - u32::SIZE) as u32;
-        for (i, b) in subarchive_line.to_be_bytes().iter().enumerate() {
+        let nest_line = (delta_len - u32::SIZE) as u32;
+        for (i, b) in nest_line.to_be_bytes().iter().enumerate() {
             self.data[self.start_index + i] = *b;
         }
     }
 }
 
-pub struct DeserializerIterator<'a, T> {
-    deserializer: Deserializer<'a>,
+/// Iterator for reading values out of a serialized array in a [Chive] instance
+/// one value at a time.
+pub struct ChiveOutIterator<'a, T> {
+    /// A ChiveOut instance pointing to a slice of serialized data containing an array
+    chive_out: ChiveOut<'a>,
+
+    /// PhantomData used to bake the type parameter T into the iterator
     _phantom_data: PhantomData<T>,
 }
 
-impl<'a, T> DeserializerIterator<'a, T> {
-    fn new(deserializer: Deserializer<'a>) -> DeserializerIterator<'a, T> {
-        DeserializerIterator {
-            deserializer,
+impl<'a, T> ChiveOutIterator<'a, T> {
+    /// Construct a new ChiveOutIterator. The chive_out instance is expected
+    /// to point to an homogenous array of serialized primitive values.
+    fn new(chive_out: ChiveOut<'a>) -> ChiveOutIterator<'a, T>
+    where
+        T: PrimitiveReadWrite,
+    {
+        debug_assert_eq!(chive_out.remaining_len() % T::SIZE, 0);
+        ChiveOutIterator {
+            chive_out,
             _phantom_data: PhantomData,
         }
     }
 }
 
-impl<'a, T: PrimitiveReadWrite> Iterator for DeserializerIterator<'a, T> {
+/// Iterator implementation for ChiveOutIterator
+impl<'a, T: PrimitiveReadWrite> Iterator for ChiveOutIterator<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        if self.deserializer.is_empty() {
+        if self.chive_out.is_empty() {
             return None;
         }
-        Some(T::read_from(&mut self.deserializer))
+        debug_assert!(self.chive_out.remaining_len() >= T::SIZE);
+        Some(T::read_from(&mut self.chive_out))
     }
 }
 
-pub struct Deserializer<'a> {
+/// ExactSizeIterator implementation for ChiveOutIterator
+impl<'a, T: PrimitiveReadWrite> ExactSizeIterator for ChiveOutIterator<'a, T> {
+    fn len(&self) -> usize {
+        debug_assert_eq!(self.chive_out.remaining_len() % T::SIZE, 0);
+        self.chive_out.remaining_len() / T::SIZE
+    }
+}
+
+/// ChiveOut is used to deserialize data out of an existing [Chive] instance.
+pub struct ChiveOut<'a> {
     data: &'a [u8],
     position: usize,
 }
 
-impl<'a> Deserializer<'a> {
-    fn new(data: &'a [u8]) -> Deserializer<'a> {
-        Deserializer { data, position: 0 }
+/// Private methods
+impl<'a> ChiveOut<'a> {
+    /// Create a new ChiveOut instance for deserializing the given slice of bytes
+    fn new(data: &'a [u8]) -> ChiveOut<'a> {
+        ChiveOut { data, position: 0 }
     }
 
+    /// Get the number of bytes that have yet to be read
     fn remaining_len(&self) -> usize {
         let l = self.data.len();
         debug_assert!(self.position <= l);
         return l - self.position;
     }
 
+    /// Read the next byte and advance past it
     fn read_byte(&mut self) -> Result<u8, ()> {
         if self.position >= self.data.len() {
             Err(())
@@ -435,6 +597,7 @@ impl<'a> Deserializer<'a> {
         }
     }
 
+    /// Read the next byte without advancing past it
     fn peek_byte(&self, offset: usize) -> Result<u8, ()> {
         if (self.position + offset) >= self.data.len() {
             Err(())
@@ -443,7 +606,10 @@ impl<'a> Deserializer<'a> {
         }
     }
 
-    fn reset_on_error<T: 'a, F: FnOnce(&mut Deserializer<'a>) -> Result<T, ()>>(
+    /// Try to perform an operation, get its result, and
+    /// rollback the position in the underlying byte vector
+    /// if it failed.
+    fn reset_on_error<T: 'a, F: FnOnce(&mut ChiveOut<'a>) -> Result<T, ()>>(
         &mut self,
         f: F,
     ) -> Result<T, ()> {
@@ -455,7 +621,9 @@ impl<'a> Deserializer<'a> {
         result
     }
 
-    fn read_primitive<T: PrimitiveReadWrite>(&mut self) -> Result<T, ()> {
+    /// Read a single primitive, checking for its type tag first and then
+    /// reading its value
+    fn read_primitive<T: PrimitiveReadWrite + 'static>(&mut self) -> Result<T, ()> {
         self.reset_on_error(|d| {
             if d.remaining_len() < (u8::SIZE + T::SIZE) {
                 return Err(());
@@ -468,7 +636,11 @@ impl<'a> Deserializer<'a> {
         })
     }
 
-    fn read_primitive_array_slice<T: PrimitiveReadWrite>(&mut self) -> Result<Vec<T>, ()> {
+    /// Read an array of primitives to a vector, checking for its tag type and length
+    /// first and then reading its values
+    fn read_primitive_array_slice<T: PrimitiveReadWrite + 'static>(
+        &mut self,
+    ) -> Result<Vec<T>, ()> {
         self.reset_on_error(|d| {
             if d.remaining_len() < (u8::SIZE + u32::SIZE) {
                 return Err(());
@@ -485,9 +657,11 @@ impl<'a> Deserializer<'a> {
         })
     }
 
-    fn read_primitive_array_iter<'b, T: PrimitiveReadWrite>(
+    /// Create an iterator that visits all primitives in an array, first checking
+    /// the tag type and length.
+    fn read_primitive_array_iter<'b, T: PrimitiveReadWrite + 'static>(
         &'b mut self,
-    ) -> Result<DeserializerIterator<'b, T>, ()> {
+    ) -> Result<ChiveOutIterator<'b, T>, ()> {
         self.reset_on_error(|d| {
             if d.remaining_len() < (u8::SIZE + u32::SIZE) {
                 return Err(());
@@ -501,105 +675,166 @@ impl<'a> Deserializer<'a> {
             if d.remaining_len() < byte_len {
                 return Err(());
             }
-            let d2 = Deserializer::new(&d.data[d.position..d.position + byte_len]);
+            let d2 = ChiveOut::new(&d.data[d.position..d.position + byte_len]);
             d.position += byte_len;
-            Ok(DeserializerIterator::new(d2))
+            Ok(ChiveOutIterator::new(d2))
         })
     }
+}
 
+/// Public methods
+impl<'a> ChiveOut<'a> {
+    /// Read a single u8 value
     pub fn u8(&mut self) -> Result<u8, ()> {
         self.read_primitive::<u8>()
     }
+
+    /// Read a single i8 value
     pub fn i8(&mut self) -> Result<i8, ()> {
         self.read_primitive::<i8>()
     }
+
+    /// Read a single u16 value
     pub fn u16(&mut self) -> Result<u16, ()> {
         self.read_primitive::<u16>()
     }
+
+    /// Read a single i16 value
     pub fn i16(&mut self) -> Result<i16, ()> {
         self.read_primitive::<i16>()
     }
+
+    /// Read a single u32 value
     pub fn u32(&mut self) -> Result<u32, ()> {
         self.read_primitive::<u32>()
     }
+
+    /// Read a single i32 value
     pub fn i32(&mut self) -> Result<i32, ()> {
         self.read_primitive::<i32>()
     }
+
+    /// Read a single u64 value
     pub fn u64(&mut self) -> Result<u64, ()> {
         self.read_primitive::<u64>()
     }
+
+    /// Read a single i64 value
     pub fn i64(&mut self) -> Result<i64, ()> {
         self.read_primitive::<i64>()
     }
+
+    /// Read a single f32 value
     pub fn f32(&mut self) -> Result<f32, ()> {
         self.read_primitive::<f32>()
     }
+
+    /// Read a single f64 value
     pub fn f64(&mut self) -> Result<f64, ()> {
         self.read_primitive::<f64>()
     }
 
+    /// Read an array of u8 values into a Vec
     pub fn array_slice_u8(&mut self) -> Result<Vec<u8>, ()> {
         self.read_primitive_array_slice::<u8>()
     }
+
+    /// Read an array of i8 values into a Vec
     pub fn array_slice_i8(&mut self) -> Result<Vec<i8>, ()> {
         self.read_primitive_array_slice::<i8>()
     }
+
+    /// Read an array of u16 values into a Vec
     pub fn array_slice_u16(&mut self) -> Result<Vec<u16>, ()> {
         self.read_primitive_array_slice::<u16>()
     }
+
+    /// Read an array of i16 values into a Vec
     pub fn array_slice_i16(&mut self) -> Result<Vec<i16>, ()> {
         self.read_primitive_array_slice::<i16>()
     }
+
+    /// Read an array of u32 values into a Vec
     pub fn array_slice_u32(&mut self) -> Result<Vec<u32>, ()> {
         self.read_primitive_array_slice::<u32>()
     }
+
+    /// Read an array of i32 values into a Vec
     pub fn array_slice_i32(&mut self) -> Result<Vec<i32>, ()> {
         self.read_primitive_array_slice::<i32>()
     }
+
+    /// Read an array of u64 values into a Vec
     pub fn array_slice_u64(&mut self) -> Result<Vec<u64>, ()> {
         self.read_primitive_array_slice::<u64>()
     }
+
+    /// Read an array of i64 values into a Vec
     pub fn array_slice_i64(&mut self) -> Result<Vec<i64>, ()> {
         self.read_primitive_array_slice::<i64>()
     }
+
+    /// Read an array of f32 values into a Vec
     pub fn array_slice_f32(&mut self) -> Result<Vec<f32>, ()> {
         self.read_primitive_array_slice::<f32>()
     }
+
+    /// Read an array of f64 values into a Vec
     pub fn array_slice_f64(&mut self) -> Result<Vec<f64>, ()> {
         self.read_primitive_array_slice::<f64>()
     }
 
-    pub fn array_iter_u8<'b>(&'b mut self) -> Result<DeserializerIterator<'b, u8>, ()> {
+    /// Read an array of u8 values into an iterator
+    pub fn array_iter_u8<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, u8>, ()> {
         self.read_primitive_array_iter::<u8>()
     }
-    pub fn array_iter_i8<'b>(&'b mut self) -> Result<DeserializerIterator<'b, i8>, ()> {
+
+    /// Read an array of i8 values into an iterator
+    pub fn array_iter_i8<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, i8>, ()> {
         self.read_primitive_array_iter::<i8>()
     }
-    pub fn array_iter_u16<'b>(&'b mut self) -> Result<DeserializerIterator<'b, u16>, ()> {
+
+    /// Read an array of u16 values into an iterator
+    pub fn array_iter_u16<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, u16>, ()> {
         self.read_primitive_array_iter::<u16>()
     }
-    pub fn array_iter_i16<'b>(&'b mut self) -> Result<DeserializerIterator<'b, i16>, ()> {
+
+    /// Read an array of i16 values into an iterator
+    pub fn array_iter_i16<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, i16>, ()> {
         self.read_primitive_array_iter::<i16>()
     }
-    pub fn array_iter_u32<'b>(&'b mut self) -> Result<DeserializerIterator<'b, u32>, ()> {
+
+    /// Read an array of u32 values into an iterator
+    pub fn array_iter_u32<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, u32>, ()> {
         self.read_primitive_array_iter::<u32>()
     }
-    pub fn array_iter_i32<'b>(&'b mut self) -> Result<DeserializerIterator<'b, i32>, ()> {
+
+    /// Read an array of i32 values into an iterator
+    pub fn array_iter_i32<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, i32>, ()> {
         self.read_primitive_array_iter::<i32>()
     }
-    pub fn array_iter_u64<'b>(&'b mut self) -> Result<DeserializerIterator<'b, u64>, ()> {
+
+    /// Read an array of u64 values into an iterator
+    pub fn array_iter_u64<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, u64>, ()> {
         self.read_primitive_array_iter::<u64>()
     }
-    pub fn array_iter_i64<'b>(&'b mut self) -> Result<DeserializerIterator<'b, i64>, ()> {
+
+    /// Read an array of i64 values into an iterator
+    pub fn array_iter_i64<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, i64>, ()> {
         self.read_primitive_array_iter::<i64>()
     }
-    pub fn array_iter_f32<'b>(&'b mut self) -> Result<DeserializerIterator<'b, f32>, ()> {
+
+    /// Read an array of f32 values into an iterator
+    pub fn array_iter_f32<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, f32>, ()> {
         self.read_primitive_array_iter::<f32>()
     }
-    pub fn array_iter_f64<'b>(&'b mut self) -> Result<DeserializerIterator<'b, f64>, ()> {
+
+    /// Read an array of f64 values into an iterator
+    pub fn array_iter_f64<'b>(&'b mut self) -> Result<ChiveOutIterator<'b, f64>, ()> {
         self.read_primitive_array_iter::<f64>()
     }
 
+    /// Read a string
     pub fn string(&mut self) -> Result<String, ()> {
         if self.remaining_len() < (u8::SIZE + u32::SIZE) {
             return Err(());
@@ -618,31 +853,38 @@ impl<'a> Deserializer<'a> {
         Ok(str_slice.to_string())
     }
 
-    pub fn subarchive<'b>(&'b mut self) -> Result<Deserializer<'b>, ()> {
+    /// Read a nested sub-chive
+    pub fn nest<'b>(&'b mut self) -> Result<ChiveOut<'b>, ()> {
         if self.remaining_len() < (u8::SIZE + u32::SIZE) {
             return Err(());
         }
         let the_type = ValueType::from_byte(self.read_byte()?)?;
-        if the_type != ValueType::SubArchive {
+        if the_type != ValueType::Nest {
             return Err(());
         }
         let len = u32::read_from(self) as usize;
         if self.remaining_len() < len {
             return Err(());
         }
-        let subarchive_slice: &[u8] = &self.data[self.position..(self.position + len)];
+        let nest_slice: &[u8] = &self.data[self.position..(self.position + len)];
         self.position += len;
-        Ok(Deserializer::new(subarchive_slice))
+        Ok(ChiveOut::new(nest_slice))
     }
 
-    pub fn object<T: Serializable>(&mut self) -> Result<T, ()> {
-        T::deserialize(self)
+    /// Read a user-provided object which implements Chivable.
+    /// The type of the object is not checked, only the types
+    /// of individual values.
+    pub fn chivable<T: Chivable>(&mut self) -> Result<T, ()> {
+        T::chive_out(self)
     }
 
+    /// Read the type of the next value
     pub fn peek_type(&self) -> Result<ValueType, ()> {
         ValueType::from_byte(self.peek_byte(0)?)
     }
 
+    /// If the next type is an array, string, or nested chive,
+    /// get its length, in bytes
     pub fn peek_length(&self) -> Result<usize, ()> {
         let the_type = ValueType::from_byte(self.peek_byte(0)?)?;
         if let ValueType::Primitive(_) = the_type {

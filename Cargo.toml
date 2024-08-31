@@ -1,7 +1,12 @@
 [package]
-name = "serialization"
+name = "chive"
 version = "0.1.0"
 edition = "2021"
+authors = ["Tim Straubinger"]
+description = "A low-level type-safe binary serialization library with support for numbers, arrays, strings, and nested sub-archives"
+repository = "https://github.com/timstr/chive"
+license = "MIT"
+keywords = ["serialization", "archive"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
