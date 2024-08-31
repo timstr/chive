@@ -10,18 +10,13 @@ let chive = Chive::with_chive_in(|mut chive_in| {
     chive_in.array_slice_u64(&[10, 11, 12, 13]);
     chive_in.string("Testing");
 
-    {
-        let mut nested_chive_in = chive_in.nest();
-
-        // Can't write to an outer chive while inside a nest.
-        // The borrow checker kindly enforces this.
-        // c1.u8(0);
-
+    chive_in.nest(|mut nested_chive_in| {
         nested_chive_in.u8(3);
         nested_chive_in.u16(4);
         nested_chive_in.array_slice_u8(&[20, 21, 22, 23]);
         nested_chive_in.array_slice_u64(&[30, 31, 32, 33]);
-    }
+    });
+
     chive_in.u8(1);
 });
 
@@ -33,7 +28,7 @@ Individual values are stored as a type tag followed by the binary value. For str
 
 ```rust
 let chive = Chive::load_from_file("path/to/file.dat")?;
-let chive_out = chive.deserialize()?;
+let chive_out = chive.chive_out()?;
 let id = d.u16()?;
 let values = chive_out.array_slice_u16()?;
 let name = chive_out.string()?;

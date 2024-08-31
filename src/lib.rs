@@ -218,8 +218,24 @@ impl Chive {
     /// data that was given to the [ChiveIn] object.
     pub fn with_chive_in<F: Fn(ChiveIn)>(f: F) -> Chive {
         let mut data = Vec::<u8>::new();
-        let chive_in = ChiveIn::new_with_prefix_len(&mut data);
+
+        data.push(0);
+        data.push(0);
+        data.push(0);
+        data.push(0);
+
+        let chive_in = ChiveIn::new(&mut data);
         f(chive_in);
+
+        debug_assert!(data.len() >= 4);
+        let len_bytes = (data.len() - 4) as u32;
+        let [b0, b1, b2, b3] = len_bytes.to_be_bytes();
+
+        data[0] = b0;
+        data[1] = b1;
+        data[2] = b2;
+        data[3] = b3;
+
         Chive { data }
     }
 
@@ -273,23 +289,13 @@ pub struct ChiveIn<'a> {
     /// Mutable reference to a vector of bytes which all serialized data
     /// will be written to
     data: &'a mut Vec<u8>,
-
-    /// Index in the data vector where the length of the serialized data
-    /// will be written to after serializing, such that during deserialization,
-    /// the length of the data can be read first.
-    // TODO: get rid of this, add a ChiveIn::nest<F: FnOnce(&mut ChiveIn)>(F)
-    // method instead
-    start_index: usize,
 }
 
 /// Private methods
 impl<'a> ChiveIn<'a> {
-    // TODO: get rid of this
-    fn new_with_prefix_len(data: &'a mut Vec<u8>) -> ChiveIn<'a> {
-        let start_index = data.len();
-        let placeholder_len: u32 = 0;
-        placeholder_len.write_to(data);
-        ChiveIn { data, start_index }
+    /// Create a new ChiveIn instance that will deserialize the given bytes
+    fn new(data: &'a mut Vec<u8>) -> ChiveIn<'a> {
+        ChiveIn { data }
     }
 
     /// Helper method to write a primitive
@@ -494,29 +500,39 @@ impl<'a> ChiveIn<'a> {
         }
     }
 
-    // TODO: replace this with something that takes a function,
-    // instead of returning a borrowing ChiveIn instance
-    pub fn nest<'b>(&'b mut self) -> ChiveIn<'b> {
+    /// Write a nested sub-chive. This creates a contiguous section of bytes
+    /// which is cleanly separated from all data before and after the nested
+    /// sub-chive. This is useful for separating concerns and (de)serializing
+    /// separate complex data structures without fear that deserializing one
+    ///  may read off the end and into the start of the next.
+    pub fn nest<F: FnOnce(ChiveIn)>(&mut self, f: F) {
         self.data.push(ValueType::Nest.to_byte());
-        ChiveIn::new_with_prefix_len(self.data)
+
+        let prefix_index = self.data.len();
+
+        self.data.push(0);
+        self.data.push(0);
+        self.data.push(0);
+        self.data.push(0);
+
+        let len_before = self.data.len();
+
+        f(ChiveIn::new(self.data));
+
+        let len_after = self.data.len();
+        debug_assert!(len_after >= len_before);
+        let len = (len_after - len_before) as u32;
+        let [b0, b1, b2, b3] = len.to_be_bytes();
+
+        self.data[prefix_index + 0] = b0;
+        self.data[prefix_index + 1] = b1;
+        self.data[prefix_index + 2] = b2;
+        self.data[prefix_index + 3] = b3;
     }
 
     /// Write a user-provided object which implements Chivable
     pub fn chivable<T: Chivable>(&mut self, chivable: &T) {
         chivable.chive_in(self);
-    }
-}
-
-// TODO: remove
-impl<'a> Drop for ChiveIn<'a> {
-    fn drop(&mut self) {
-        let new_len = self.data.len();
-        let delta_len = new_len - self.start_index;
-        debug_assert!(delta_len >= u32::SIZE);
-        let nest_line = (delta_len - u32::SIZE) as u32;
-        for (i, b) in nest_line.to_be_bytes().iter().enumerate() {
-            self.data[self.start_index + i] = *b;
-        }
     }
 }
 
@@ -885,7 +901,7 @@ impl<'a> ChiveOut<'a> {
 
     /// If the next type is an array, string, or nested chive,
     /// get its length, in bytes
-    pub fn peek_length(&self) -> Result<usize, ()> {
+    pub fn peek_length_bytes(&self) -> Result<usize, ()> {
         let the_type = ValueType::from_byte(self.peek_byte(0)?)?;
         if let ValueType::Primitive(_) = the_type {
             return Err(());
@@ -898,6 +914,7 @@ impl<'a> ChiveOut<'a> {
         ]) as usize)
     }
 
+    /// Returns true iff the chive contains no more data to read
     pub fn is_empty(&self) -> bool {
         return self.position == self.data.len();
     }
